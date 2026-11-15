@@ -1,0 +1,12 @@
+.build/
+build/
+.cache/
+.tmp/
+.DS_Store
+.claude/settings.local.json
+*.dmg
+AGENTS.md
+LOCALREADME.md
+run.sh
+scripts/
+Tests/Scripts/

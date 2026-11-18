@@ -36,19 +36,29 @@ final class TransferTask: Identifiable, ObservableObject {
     }
 }
 
-/// Runs uploads/downloads one at a time via `SSHSession`, polling file size on the side
+/// Runs up to `maxConcurrent` uploads/downloads at once via `SSHSession`, polling file size on the side
 /// (local stat for downloads, remote `stat` for uploads) to approximate progress, since the
 /// underlying `scp`/`ssh` processes don't expose a machine-readable progress stream when piped.
 @MainActor
 final class TransferQueue: ObservableObject {
     @Published var tasks: [TransferTask] = []
 
+    /// Parallel transfers share the SSH master connection; the default stays well below
+    /// sshd's usual `MaxSessions` (10) even with progress polling and panel listings.
+    var maxConcurrent: Int {
+        didSet { processNext() }
+    }
+
     private var pendingWork: [() async -> Void] = []
-    private var isProcessing = false
+    private var runningCount = 0
+
+    init(maxConcurrent: Int = TransferSettings.defaultParallelTransfers) {
+        self.maxConcurrent = maxConcurrent
+    }
 
     /// With `moveSource`, the local item goes to the Trash once the remote copy has the same size.
     func enqueueUpload(session: SSHSession, localURL: URL, remotePath: String, isDirectory: Bool,
-                       moveSource: Bool = false, completion: @escaping () -> Void) {
+                       moveSource: Bool = false, compress: Bool = false, completion: @escaping () -> Void) {
         let totalBytes = isDirectory ? nil : localFileSize(localURL)
         let task = TransferTask(direction: .upload, name: localURL.lastPathComponent, isMove: moveSource)
         tasks.append(task)
@@ -70,7 +80,7 @@ final class TransferQueue: ObservableObject {
             }
 
             do {
-                try await session.upload(localPath: localURL.path, remotePath: remotePath, isDirectory: isDirectory)
+                try await session.upload(localPath: localURL.path, remotePath: remotePath, isDirectory: isDirectory, compress: compress)
             } catch {
                 pollTask?.cancel()
                 task.state = .failed(error.localizedDescription)
@@ -95,7 +105,7 @@ final class TransferQueue: ObservableObject {
 
     /// With `moveSource`, the remote item is deleted once the local copy has the same size.
     func enqueueDownload(session: SSHSession, remotePath: String, localURL: URL, remoteSize: Int64?, isDirectory: Bool,
-                         moveSource: Bool = false, completion: @escaping () -> Void) {
+                         moveSource: Bool = false, compress: Bool = false, completion: @escaping () -> Void) {
         let totalBytes = isDirectory ? nil : remoteSize
         let task = TransferTask(direction: .download, name: localURL.lastPathComponent, isMove: moveSource)
         tasks.append(task)
@@ -117,7 +127,7 @@ final class TransferQueue: ObservableObject {
             }
 
             do {
-                try await session.download(remotePath: remotePath, localPath: localURL.path, isDirectory: isDirectory)
+                try await session.download(remotePath: remotePath, localPath: localURL.path, isDirectory: isDirectory, compress: compress)
             } catch {
                 pollTask?.cancel()
                 task.state = .failed(error.localizedDescription)
@@ -208,13 +218,14 @@ final class TransferQueue: ObservableObject {
     }
 
     private func processNext() {
-        guard !isProcessing, !pendingWork.isEmpty else { return }
-        isProcessing = true
-        let work = pendingWork.removeFirst()
-        Task {
-            await work()
-            isProcessing = false
-            processNext()
+        while runningCount < max(1, maxConcurrent), !pendingWork.isEmpty {
+            runningCount += 1
+            let work = pendingWork.removeFirst()
+            Task {
+                await work()
+                runningCount -= 1
+                processNext()
+            }
         }
     }
 }

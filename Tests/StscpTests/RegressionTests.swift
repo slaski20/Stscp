@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Foundation
+import AppKit
+import UniformTypeIdentifiers
 import Testing
 @testable import Stscp
 
@@ -188,7 +190,8 @@ struct ModelRegressionTests {
         let stub = CommandStub()
         let model = RemotePanelModel(makeSession: { SSHSession(run: { try await stub.run($0, $1) }) })
         await model.connect(to: profile())
-        let queue = TransferQueue()
+        // One at a time, so the second transfer is still waiting when the server changes.
+        let queue = TransferQueue(maxConcurrent: 1)
         await stub.blockNextTransfer()
         for name in ["one", "two"] {
             queue.enqueueUpload(session: model.session,
@@ -358,14 +361,45 @@ struct ReviewRegressionTests {
         #expect(await server.calls.count == before + 1)
     }
 
-    @Test func folderTransfersTargetParentDirectory() async throws {
+    @Test func folderTransfersStreamTarIntoParentDirectory() async throws {
         let server = ScriptedServer()
         let model = await connectedModel(server)
-        try await model.session.upload(localPath: "/local/dir", remotePath: "/home/test/dir", isDirectory: true)
-        try await model.session.download(remotePath: "/home/test/dir", localPath: "/local/dl/dir", isDirectory: true)
-        let scp = await server.calls.filter { $0.0 == "/usr/bin/scp" }.map(\.1)
-        #expect(scp.first?.suffix(2) == ["/local/dir", "tester@first.example:/home/test"])
-        #expect(scp.last?.suffix(2) == ["tester@first.example:/home/test/dir", "/local/dl"])
+        try await model.session.upload(localPath: "/local/-dir", remotePath: "/home/test/-dir", isDirectory: true)
+        try await model.session.download(remotePath: "/home/test/dir", localPath: "/local/dl/dir", isDirectory: true,
+                                         compress: true)
+        let calls = await server.calls
+        #expect(!calls.contains { $0.0 == "/usr/bin/scp" })
+        let localTar = calls.filter { $0.0 == "/usr/bin/tar" }.map(\.1)
+        let remoteTar = calls.filter { $0.0 == "/usr/bin/ssh" && $0.1.contains("'tar'") }.map(\.1)
+        #expect(localTar.first == ["-c", "--no-mac-metadata", "--no-xattrs", "-f", "-", "-C", "/local", "./-dir"])
+        #expect(remoteTar.first?.suffix(7) == ["'tar'", "'-x'", "'-o'", "'-f'", "'-'", "'-C'", "'/home/test'"])
+        #expect(remoteTar.last?.suffix(8) == ["'tar'", "'-c'", "'-z'", "'-f'", "'-'", "'-C'", "'/home/test'", "'./dir'"])
+        #expect(localTar.last == ["-x", "-o", "-z", "-f", "-", "-C", "/local/dl"])
+    }
+
+    @Test func folderTransferFallsBackToScpWithoutRemoteTar() async throws {
+        let session = SSHSession(run: { executable, arguments in
+            if executable == "/usr/bin/ssh", arguments.contains("'tar'") {
+                return ProcessResult(exitCode: 127, stdout: "", stderr: "tar: command not found")
+            }
+            return ProcessResult(exitCode: 0, stdout: "", stderr: "")
+        })
+        try await session.connect(profile())
+        try await session.upload(localPath: "/local/dir", remotePath: "/home/test/dir", isDirectory: true)
+        try await session.download(remotePath: "/home/test/dir", localPath: "/local/dl/dir", isDirectory: true)
+    }
+
+    @Test func folderTransferReportsTarFailure() async throws {
+        let session = SSHSession(run: { executable, arguments in
+            if executable == "/usr/bin/ssh", arguments.contains("'tar'") {
+                return ProcessResult(exitCode: 2, stdout: "", stderr: "tar: Cannot open: Permission denied")
+            }
+            return ProcessResult(exitCode: 0, stdout: "", stderr: "")
+        })
+        try await session.connect(profile())
+        await #expect(throws: SSHError.self) {
+            try await session.upload(localPath: "/local/dir", remotePath: "/home/test/dir", isDirectory: true)
+        }
     }
 
     @Test func siteStoreToleratesMissingKeysAndKeepsCorruptFiles() throws {
@@ -569,5 +603,208 @@ struct PasswordAuthRegressionTests {
         let json = #"[{"name":"Old","host":"h.example","port":22,"username":"u"}]"#
         let sites = try JSONDecoder().decode([SiteProfile].self, from: Data(json.utf8))
         #expect(sites.first?.authMethod == .key)
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+struct TerminalRegressionTests {
+    @Test func remoteTerminalReusesMasterWithoutCredentials() async throws {
+        let session = SSHSession(run: { _, _ in ProcessResult(exitCode: 0, stdout: "", stderr: "") })
+        await #expect(throws: SSHError.self) { try await session.interactiveShellArguments(startingIn: "/tmp") }
+
+        var site = profile()
+        site.authMethod = .password
+        try await session.connect(site, password: "secret")
+        let args = try await session.interactiveShellArguments(startingIn: "/home/it's here")
+        #expect(args.contains("-t"))
+        #expect(args.contains("ControlMaster=no"))
+        #expect(args.contains { $0.hasPrefix("ControlPath=/tmp/stscp-") })
+        #expect(!args.contains("BatchMode=yes"))
+        #expect(!args.joined(separator: " ").contains("secret"))
+        #expect(args.suffix(2) == ["tester@first.example", #"cd '/home/it'\''s here'; exec "$SHELL" -l"#])
+    }
+
+    @Test func commandScriptQuotesEveryArgument() {
+        let script = TerminalLauncher.commandScript(executable: "/usr/bin/ssh", arguments: ["-p", "22", "a b", "x'y"])
+        #expect(script == "#!/bin/sh\nrm -f -- \"$0\"\nexec '/usr/bin/ssh' '-p' '22' 'a b' 'x'\\''y'\n")
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+@MainActor
+struct EditorRegressionTests {
+    @Test func editorChoicePersistsAndFallsBackToTextEdit() throws {
+        let suite = "stscp-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let settings = EditorSettings(defaults: defaults)
+        #expect(settings.isUsingDefault)
+        settings.editorPath = "/Applications/Missing Editor.app"
+        #expect(EditorSettings(defaults: defaults).editorPath == "/Applications/Missing Editor.app")
+        // An uninstalled editor must not break viewing.
+        #expect(settings.editorURL?.lastPathComponent == "TextEdit.app")
+        settings.resetToDefault()
+        #expect(EditorSettings(defaults: defaults).editorPath == nil)
+    }
+
+    @Test func remotePreviewIsReadOnlyCopyAndRefusesFolders() async throws {
+        let session = SSHSession(run: { executable, arguments in
+            if arguments.contains("'/bin/sh'") {
+                let isFolder = arguments.last == "'/srv/folder'"
+                return ProcessResult(exitCode: 0, stdout: isFolder ? "d\n" : "f\n", stderr: "")
+            }
+            if executable == "/usr/bin/scp", let target = arguments.last {
+                try Data("hello".utf8).write(to: URL(fileURLWithPath: target))
+            }
+            return ProcessResult(exitCode: 0, stdout: "", stderr: "")
+        })
+        try await session.connect(profile())
+
+        let copy = try await session.downloadPreviewCopy(of: "/srv/notes.txt")
+        defer { try? FileManager.default.removeItem(at: copy.deletingLastPathComponent()) }
+        #expect(copy.lastPathComponent == "notes.txt")
+        #expect(try String(contentsOf: copy, encoding: .utf8) == "hello")
+        let mode = try FileManager.default.attributesOfItem(atPath: copy.path)[.posixPermissions] as? Int
+        #expect(mode == 0o400)
+
+        await #expect(throws: SSHError.self) { try await session.downloadPreviewCopy(of: "/srv/folder") }
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+struct PipelineRegressionTests {
+    @Test func pipesProducerIntoConsumerAndReportsBothStatuses() async throws {
+        let (producer, consumer) = try await ProcessRunner.runPipeline(
+            PipelineStage(executable: "/bin/echo", arguments: ["hello"]),
+            into: PipelineStage(executable: "/usr/bin/tr", arguments: ["a-z", "A-Z"]))
+        #expect(producer.exitCode == 0)
+        #expect(consumer.exitCode == 0)
+        #expect(consumer.stdout == "HELLO\n")
+    }
+
+    @Test func producerFailureIsNotHiddenByConsumer() async throws {
+        let (producer, consumer) = try await ProcessRunner.runPipeline(
+            PipelineStage(executable: "/bin/sh", arguments: ["-c", "echo broken >&2; exit 3"]),
+            into: PipelineStage(executable: "/bin/cat", arguments: []))
+        #expect(producer.exitCode == 3)
+        #expect(producer.stderr == "broken\n")
+        #expect(consumer.exitCode == 0)
+    }
+
+    /// The same flags the folder transfer uses, with a real tar on both ends (no ssh).
+    @Test func tarStreamRoundTripsFolderWithDashName() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("src/-dir/sub", isDirectory: true)
+        let target = root.appendingPathComponent("dst", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data(repeating: 65, count: 100_000).write(to: source.appendingPathComponent("a.txt"))
+        for compress in [false, true] {
+            let gzip = compress ? ["-z"] : []
+            let (producer, consumer) = try await ProcessRunner.runPipeline(
+                PipelineStage(executable: "/usr/bin/tar", arguments: ["-c", "--no-mac-metadata", "--no-xattrs"]
+                    + gzip + ["-f", "-", "-C", root.appendingPathComponent("src").path, "./-dir"]),
+                into: PipelineStage(executable: "/usr/bin/tar", arguments: ["-x", "-o"] + gzip + ["-f", "-", "-C", target.path]),
+                environment: ["COPYFILE_DISABLE": "1"])
+            #expect(producer.exitCode == 0 && consumer.exitCode == 0)
+            let copied = try Data(contentsOf: target.appendingPathComponent("-dir/sub/a.txt"))
+            #expect(copied.count == 100_000)
+        }
+    }
+
+    @Test func missingProducerEndsWaitingConsumer() async throws {
+        let (producer, _) = try await ProcessRunner.runPipeline(
+            PipelineStage(executable: "/nonexistent/tool", arguments: []),
+            into: PipelineStage(executable: "/bin/cat", arguments: []))
+        #expect(producer.exitCode == 127)
+    }
+}
+
+/// Holds every scp call until released, counting how many run at the same time.
+private actor ConcurrencyProbe {
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    private(set) var started = 0
+
+    var blocked: Int { waiting.count }
+
+    func run(_ executable: String, _ arguments: [String]) async -> ProcessResult {
+        if executable == "/usr/bin/scp" {
+            started += 1
+            await withCheckedContinuation { waiting.append($0) }
+        }
+        return ProcessResult(exitCode: 0, stdout: "/home/test\n", stderr: "")
+    }
+
+    func releaseAll() {
+        waiting.forEach { $0.resume() }
+        waiting.removeAll()
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+@MainActor
+struct ParallelTransferRegressionTests {
+    @Test func queueRunsUpToLimitAtOnce() async throws {
+        let probe = ConcurrencyProbe()
+        let session = SSHSession(run: { await probe.run($0, $1) })
+        try await session.connect(profile())
+        let queue = TransferQueue(maxConcurrent: 3)
+        for index in 0..<5 {
+            queue.enqueueDownload(session: session, remotePath: "/home/test/\(index)",
+                                  localURL: URL(fileURLWithPath: "/nonexistent/\(index)"),
+                                  remoteSize: nil, isDirectory: false, completion: {})
+        }
+        while await probe.blocked < 3 { await Task.yield() }
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await probe.started == 3)
+        #expect(queue.tasks.filter { $0.state == .queued }.count == 2)
+
+        while queue.tasks.contains(where: { $0.state != .completed }) {
+            await probe.releaseAll()
+            await Task.yield()
+        }
+        #expect(await probe.started == 5)
+    }
+
+    @Test func settingsClampAndPersist() throws {
+        let suite = "stscp-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = TransferSettings(defaults: defaults)
+        #expect(settings.parallelTransfers == 3)
+        #expect(!settings.compressFolderTransfers)
+        settings.parallelTransfers = 9
+        settings.compressFolderTransfers = true
+        let reloaded = TransferSettings(defaults: defaults)
+        #expect(reloaded.parallelTransfers == 4)
+        #expect(reloaded.compressFolderTransfers)
+    }
+}
+
+@Suite
+@MainActor
+struct DragRegressionTests {
+    @Test func dropReadsPayloadFromPasteboardOrDragInProgress() throws {
+        let pasteboard = NSPasteboard(name: .init("stscp-test-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        let type = NSPasteboard.PasteboardType(UTType.stscpLocalPayload.identifier)
+        let payload = LocalDragPayload(entries: [.init(path: "/tmp/a.txt", isDirectory: false)])
+
+        pasteboard.clearContents()
+        pasteboard.setData(try JSONEncoder().encode(payload), forType: type)
+        #expect(InternalDrag.payload(LocalDragPayload.self, uti: .stscpLocalPayload, from: pasteboard)?.entries.first?.path == "/tmp/a.txt")
+
+        // Type announced but data not delivered: fall back to the drag this process started.
+        _ = InternalDrag.provider(for: LocalDragPayload(entries: [.init(path: "/tmp/b", isDirectory: true)]))
+        pasteboard.clearContents()
+        pasteboard.setData(Data(), forType: type)
+        #expect(InternalDrag.payload(LocalDragPayload.self, uti: .stscpLocalPayload, from: pasteboard)?.entries.first?.path == "/tmp/b")
+
+        // Unrelated drags (e.g. text) never pick up a stale payload.
+        pasteboard.clearContents()
+        pasteboard.setString("hello", forType: .string)
+        #expect(InternalDrag.payload(LocalDragPayload.self, uti: .stscpLocalPayload, from: pasteboard) == nil)
     }
 }

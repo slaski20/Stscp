@@ -75,7 +75,102 @@ private final class ProcessOutput: @unchecked Sendable {
     }
 }
 
+/// One side of a two-process pipeline (`producer | consumer`).
+struct PipelineStage: Sendable, Equatable {
+    let executable: String
+    let arguments: [String]
+}
+
+/// Resumes once both pipeline processes have exited, whatever order they finish in.
+private final class PipelineCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [ProcessResult?] = [nil, nil]
+    private var continuation: CheckedContinuation<(ProcessResult, ProcessResult), Error>?
+
+    init(_ continuation: CheckedContinuation<(ProcessResult, ProcessResult), Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ index: Int, _ result: ProcessResult) {
+        lock.lock()
+        results[index] = result
+        guard let first = results[0], let second = results[1], let continuation else {
+            lock.unlock()
+            return
+        }
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(returning: (first, second))
+    }
+}
+
 enum ProcessRunner {
+    /// Runs `producer | consumer` without a shell, so no argument is ever re-parsed, and reports
+    /// both exit statuses (a shell pipeline would hide the producer's failure).
+    static func runPipeline(_ producer: PipelineStage, into consumer: PipelineStage,
+                            environment: [String: String] = [:]) async throws -> (ProcessResult, ProcessResult) {
+        try await withCheckedThrowingContinuation { continuation in
+            let collector = PipelineCollector(continuation)
+            let first = Process()
+            let second = Process()
+            for (process, stage) in [(first, producer), (second, consumer)] {
+                process.executableURL = URL(fileURLWithPath: stage.executable)
+                process.arguments = stage.arguments
+                if !environment.isEmpty {
+                    process.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
+                }
+            }
+            let link = Pipe()
+            let firstErr = Pipe()
+            let secondOut = Pipe()
+            let secondErr = Pipe()
+            first.standardInput = FileHandle.nullDevice
+            first.standardOutput = link
+            first.standardError = firstErr
+            second.standardInput = link
+            second.standardOutput = secondOut
+            second.standardError = secondErr
+
+            let outputs = [ProcessOutput(firstErr.fileHandleForReading),
+                           ProcessOutput(secondOut.fileHandleForReading),
+                           ProcessOutput(secondErr.fileHandleForReading)]
+            let handles = [firstErr, secondOut, secondErr].map(\.fileHandleForReading)
+            for (handle, output) in zip(handles, outputs) {
+                handle.readabilityHandler = { _ in output.drain() }
+            }
+            first.terminationHandler = { finished in
+                firstErr.fileHandleForReading.readabilityHandler = nil
+                outputs[0].drain()
+                collector.finish(0, ProcessResult(exitCode: finished.terminationStatus, stdout: "", stderr: outputs[0].text))
+            }
+            second.terminationHandler = { finished in
+                secondOut.fileHandleForReading.readabilityHandler = nil
+                secondErr.fileHandleForReading.readabilityHandler = nil
+                outputs[1].drain()
+                outputs[2].drain()
+                collector.finish(1, ProcessResult(exitCode: finished.terminationStatus,
+                                                  stdout: outputs[1].text, stderr: outputs[2].text))
+            }
+
+            do {
+                try second.run()
+            } catch {
+                handles.forEach { $0.readabilityHandler = nil }
+                continuation.resume(throwing: error)
+                return
+            }
+            do {
+                try first.run()
+            } catch {
+                // The consumer is already waiting for input: end it instead of leaving it blocked.
+                firstErr.fileHandleForReading.readabilityHandler = nil
+                try? link.fileHandleForWriting.close()
+                second.terminate()
+                collector.finish(0, ProcessResult(exitCode: 127, stdout: "", stderr: error.localizedDescription))
+            }
+        }
+    }
+
     static func run(executable: String, arguments: [String], environment: [String: String] = [:]) async throws -> ProcessResult {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
@@ -127,19 +222,26 @@ actor SSHSession {
     /// Held only in memory for this connection; never written to disk or passed as an argument.
     private var password: String?
     private let run: @Sendable (String, [String], [String: String]) async throws -> ProcessResult
+    private let runPipeline: @Sendable (PipelineStage, PipelineStage, [String: String]) async throws -> (ProcessResult, ProcessResult)
 
     init() {
         self.run = { try await ProcessRunner.run(executable: $0, arguments: $1, environment: $2) }
+        self.runPipeline = { try await ProcessRunner.runPipeline($0, into: $1, environment: $2) }
     }
 
-    /// Test seam that ignores the process environment.
+    /// Test seam that ignores the process environment. Pipelines run their two stages
+    /// through `run` one after the other, so tests see (and can answer) both commands.
     init(run: @escaping @Sendable (String, [String]) async throws -> ProcessResult) {
-        self.run = { executable, arguments, _ in try await run(executable, arguments) }
+        self.init(runWithEnvironment: { executable, arguments, _ in try await run(executable, arguments) })
     }
 
     /// Test seam that also receives the extra environment (used for password authentication).
     init(runWithEnvironment: @escaping @Sendable (String, [String], [String: String]) async throws -> ProcessResult) {
         self.run = runWithEnvironment
+        self.runPipeline = { producer, consumer, environment in
+            (try await runWithEnvironment(producer.executable, producer.arguments, environment),
+             try await runWithEnvironment(consumer.executable, consumer.arguments, environment))
+        }
     }
 
     var isConnected: Bool { profile != nil }
@@ -266,8 +368,13 @@ actor SSHSession {
 
     /// For folders the parent is the scp target: `scp -r dir host:/x/dir` nests into `/x/dir/dir`
     /// when `/x/dir` already exists, whereas `scp -r dir host:/x` creates or merges `/x/dir`.
-    func upload(localPath: String, remotePath: String, isDirectory: Bool = false) async throws {
+    ///
+    /// Folders go as one `tar` stream instead (see `transferFolderWithTar`), unless the server has no `tar`.
+    func upload(localPath: String, remotePath: String, isDirectory: Bool = false, compress: Bool = false) async throws {
         guard let profile, let controlPath else { throw SSHError.notConnected }
+        if isDirectory, try await transferFolderWithTar(.upload, localPath: localPath, remotePath: remotePath, compress: compress) {
+            return
+        }
         let target = isDirectory ? RemotePath.parent(of: remotePath) : remotePath
         let args = scpOptionArgs(for: profile, controlPath: controlPath, password: password)
             + [localPath, "\(scpHost(for: profile)):\(target)"]
@@ -278,8 +385,11 @@ actor SSHSession {
         }
     }
 
-    func download(remotePath: String, localPath: String, isDirectory: Bool = false) async throws {
+    func download(remotePath: String, localPath: String, isDirectory: Bool = false, compress: Bool = false) async throws {
         guard let profile, let controlPath else { throw SSHError.notConnected }
+        if isDirectory, try await transferFolderWithTar(.download, localPath: localPath, remotePath: remotePath, compress: compress) {
+            return
+        }
         let target = isDirectory ? (localPath as NSString).deletingLastPathComponent : localPath
         let args = scpOptionArgs(for: profile, controlPath: controlPath, password: password)
             + ["\(scpHost(for: profile)):\(remotePath)", target]
@@ -288,6 +398,91 @@ actor SSHSession {
             throw SSHError.commandFailed(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "Download failed." : result.stderr)
         }
+    }
+
+    /// Downloads a remote file into its own temporary folder for viewing and makes the copy
+    /// read-only, since edits to it are never uploaded back. Links to folders are refused.
+    func downloadPreviewCopy(of remotePath: String) async throws -> URL {
+        guard try await itemKinds([remotePath]).first == .file else {
+            throw SSHError.commandFailed("Only files can be viewed.")
+        }
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stscp-view-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        let name = (remotePath as NSString).lastPathComponent
+        let local = folder.appendingPathComponent(name.isEmpty ? "file" : name)
+        do {
+            try await download(remotePath: remotePath, localPath: local.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: local.path)
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            throw error
+        }
+        return local
+    }
+
+    /// `ssh` arguments for an interactive shell in Terminal that starts in `path`. It rides this
+    /// connection's master socket, so no credentials are needed or passed; `ControlMaster=no`
+    /// keeps the terminal from becoming a master. If the master is gone, ssh connects on its own
+    /// and may prompt in the terminal, hence no `BatchMode`.
+    func interactiveShellArguments(startingIn path: String) throws -> [String] {
+        guard let profile, let controlPath else { throw SSHError.notConnected }
+        var args = [
+            "-t",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=\(controlPath)",
+            "-p", String(profile.port)
+        ]
+        let identity = profile.identityFile.trimmingCharacters(in: .whitespaces)
+        if profile.authMethod == .key, !identity.isEmpty {
+            args += ["-i", identity]
+        }
+        // `;` rather than `&&`: a missing folder should still leave the user in a shell.
+        let remoteCommand = "cd \(Self.shellEscape(path)); exec \"$SHELL\" -l"
+        return args + [destination(for: profile), remoteCommand]
+    }
+
+    /// `scp -r` opens and acknowledges every file separately, which dominates when a folder holds
+    /// many small files; a single `tar` stream avoids that. Both sides extract into the parent
+    /// folder, merging like `scp -r`, with ownership not restored (`-o`). `compress` adds gzip.
+    /// Returns `false` when the server has no `tar` (exit 127), so the caller can fall back to scp.
+    private func transferFolderWithTar(_ direction: TransferDirection, localPath: String, remotePath: String,
+                                       compress: Bool) async throws -> Bool {
+        guard let profile, let controlPath else { throw SSHError.notConnected }
+        let gzip = compress ? ["-z"] : []
+        let localParent = (localPath as NSString).deletingLastPathComponent
+        let remoteParent = RemotePath.parent(of: remotePath)
+        let ssh = { (remoteArgs: [String]) in
+            PipelineStage(executable: "/usr/bin/ssh",
+                          arguments: self.sshOptionArgs(for: profile, controlPath: controlPath, password: self.password)
+                              + [self.destination(for: profile)] + remoteArgs.map(Self.shellEscape))
+        }
+        // `./name` keeps names that start with "-" from being read as options.
+        let producer: PipelineStage
+        let consumer: PipelineStage
+        switch direction {
+        case .upload:
+            // No AppleDouble `._` files or macOS metadata in archives meant for other systems.
+            producer = PipelineStage(executable: "/usr/bin/tar", arguments: ["-c", "--no-mac-metadata", "--no-xattrs"]
+                + gzip + ["-f", "-", "-C", localParent, "./" + (localPath as NSString).lastPathComponent])
+            consumer = ssh(["tar", "-x", "-o"] + gzip + ["-f", "-", "-C", remoteParent])
+        case .download:
+            producer = ssh(["tar", "-c"] + gzip + ["-f", "-", "-C", remoteParent, "./" + (remotePath as NSString).lastPathComponent])
+            consumer = PipelineStage(executable: "/usr/bin/tar", arguments: ["-x", "-o"] + gzip + ["-f", "-", "-C", localParent])
+        }
+        let environment = try Self.authEnvironment(password: password).merging(["COPYFILE_DISABLE": "1"]) { $1 }
+        let (produced, consumed) = try await runPipeline(producer, consumer, environment)
+
+        let remoteResult = direction == .upload ? consumed : produced
+        if remoteResult.exitCode == 127 { return false }
+        for result in [produced, consumed] where result.exitCode != 0 {
+            let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw SSHError.commandFailed(message.isEmpty
+                ? (direction == .upload ? "Upload failed." : "Download failed.") : message)
+        }
+        return true
     }
 
     // MARK: - Command plumbing
@@ -390,7 +585,7 @@ actor SSHSession {
         }
     }()
 
-    private static func shellEscape(_ value: String) -> String {
+    static func shellEscape(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 

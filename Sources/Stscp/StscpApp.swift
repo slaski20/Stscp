@@ -80,7 +80,24 @@ struct StscpApp: App {
                     NotificationCenter.default.post(name: .commanderAction, object: CommanderAction.refresh)
                 }
                 .keyboardShortcut("r", modifiers: [.command])
+
+                Divider()
+
+                // Local panel: Terminal in the current folder; remote panel: ssh into the current remote folder.
+                Button("Open Terminal") {
+                    NotificationCenter.default.post(name: .commanderAction, object: CommanderAction.openTerminal)
+                }
+                .keyboardShortcut("t", modifiers: [.command, .option])
+
+                Button("View in Editor") {
+                    NotificationCenter.default.post(name: .commanderAction, object: CommanderAction.viewFile)
+                }
+                .keyboardShortcut(Self.functionKey(NSF3FunctionKey), modifiers: [])
             }
+        }
+
+        Settings {
+            SettingsView()
         }
     }
 }
@@ -105,6 +122,10 @@ enum CommanderAction {
     case delete
     case newFolder
     case refresh
+    /// Opens Terminal in the active panel's folder: locally, or over SSH for the remote panel.
+    case openTerminal
+    /// Opens the selected file in the editor chosen in Settings (remote files via a temporary copy).
+    case viewFile
     case siteManager
     case disconnect
 }

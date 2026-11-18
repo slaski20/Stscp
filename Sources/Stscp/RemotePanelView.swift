@@ -54,8 +54,7 @@ struct RemotePanelView: View {
     private func handleDrop(_ pasteboard: NSPasteboard) -> Bool {
         guard model.isConnected else { return false }
 
-        if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(UTType.stscpLocalPayload.identifier)),
-           let payload = try? JSONDecoder().decode(LocalDragPayload.self, from: data),
+        if let payload = InternalDrag.payload(LocalDragPayload.self, uti: .stscpLocalPayload, from: pasteboard),
            !payload.entries.isEmpty {
             onDropUpload(payload.entries)
             return true
@@ -257,7 +256,7 @@ struct RemotePanelView: View {
         if item.isParentNavigation {
             content
         } else {
-            content.draggable(dragPayload(for: item))
+            content.onDrag { InternalDrag.provider(for: dragPayload(for: item)) }
         }
     }
 

@@ -60,8 +60,7 @@ struct LocalPanelView: View {
     }
 
     private func handleDrop(_ pasteboard: NSPasteboard) -> Bool {
-        guard let data = pasteboard.data(forType: NSPasteboard.PasteboardType(UTType.stscpRemotePayload.identifier)),
-              let payload = try? JSONDecoder().decode(RemoteDragPayload.self, from: data),
+        guard let payload = InternalDrag.payload(RemoteDragPayload.self, uti: .stscpRemotePayload, from: pasteboard),
               !payload.entries.isEmpty else { return false }
         return onDropDownload(payload)
     }
@@ -182,7 +181,7 @@ struct LocalPanelView: View {
         if item.isParentNavigation {
             content
         } else {
-            content.draggable(dragPayload(for: item))
+            content.onDrag { InternalDrag.provider(for: dragPayload(for: item)) }
         }
     }
 

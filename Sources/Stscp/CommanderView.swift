@@ -10,6 +10,7 @@ struct CommanderView: View {
     @StateObject private var remotePanel = RemotePanelModel()
     @StateObject private var siteStore = SiteStore()
     @StateObject private var transferQueue = TransferQueue()
+    @ObservedObject private var transferSettings = TransferSettings.shared
 
     @State private var activeSide: PanelSide = .local
     @State private var pendingDialog: PendingDialog?
@@ -59,6 +60,8 @@ struct CommanderView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         // Closing the window must not leave the SSH ControlMaster running in the background.
         .onDisappear { Task { await remotePanel.disconnect() } }
+        .onAppear { transferQueue.maxConcurrent = transferSettings.parallelTransfers }
+        .onChange(of: transferSettings.parallelTransfers) { transferQueue.maxConcurrent = $0 }
         .onReceive(NotificationCenter.default.publisher(for: .focusCommanderPanel)) { notification in
             guard controlActiveState == .key,
                   let side = notification.object as? PanelSide else { return }
@@ -177,6 +180,7 @@ struct CommanderView: View {
 
     private var functionBar: some View {
         HStack(spacing: 8) {
+            commandButton("F3 View", "eye", action: .viewFile)
             // Direction follows the active panel, so one Copy/Move pair covers upload and download.
             commandButton(activeSide == .local ? "F5 Copy →" : "F5 ← Copy", "doc.on.doc", action: .copy)
             commandButton(activeSide == .local ? "F6 Move →" : "F6 ← Move", "arrow.right.doc.on.clipboard", action: .move)
@@ -184,6 +188,7 @@ struct CommanderView: View {
             commandButton("Rename", "pencil", action: .rename)
             commandButton("Delete", "trash", action: .delete)
             commandButton("Refresh", "arrow.clockwise", action: .refresh)
+            commandButton(activeSide == .local ? "Terminal" : "SSH Terminal", "terminal", action: .openTerminal)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -218,10 +223,70 @@ struct CommanderView: View {
             newFolderInActivePanel()
         case .refresh:
             refreshActivePanel()
+        case .openTerminal:
+            openTerminalForActivePanel()
+        case .viewFile:
+            viewSelectedFile()
         case .siteManager:
             showSiteManager = true
         case .disconnect:
             Task { await remotePanel.disconnect() }
+        }
+    }
+
+    private func openTerminalForActivePanel() {
+        switch activeSide {
+        case .local:
+            let folder = localPanel.currentURL
+            Task {
+                do {
+                    try await TerminalLauncher.openLocal(at: folder)
+                } catch {
+                    localPanel.error = LocalOperationError(message: "Cannot open Terminal: \(error.localizedDescription)")
+                }
+            }
+        case .remote:
+            guard remotePanel.isConnected else {
+                remotePanel.error = RemoteOperationError(message: "Connect to a site before opening a remote terminal.")
+                return
+            }
+            let session = remotePanel.session
+            let path = remotePanel.currentPath
+            Task {
+                do {
+                    let arguments = try await session.interactiveShellArguments(startingIn: path)
+                    try await TerminalLauncher.run(executable: "/usr/bin/ssh", arguments: arguments)
+                } catch {
+                    remotePanel.error = RemoteOperationError(message: "Cannot open remote terminal: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func viewSelectedFile() {
+        let editor = EditorSettings.shared
+        switch activeSide {
+        case .local:
+            guard let item = localPanel.selectedItems.first(where: { !$0.isDirectory }) else { return }
+            Task {
+                do {
+                    try await editor.open(item.url)
+                } catch {
+                    localPanel.error = LocalOperationError(message: "Cannot open \(item.name): \(error.localizedDescription)")
+                }
+            }
+        case .remote:
+            guard remotePanel.isConnected,
+                  let item = remotePanel.selectedItems.first(where: { !$0.isDirectory }) else { return }
+            let session = remotePanel.session
+            Task {
+                do {
+                    let copy = try await session.downloadPreviewCopy(of: item.path)
+                    try await editor.open(copy)
+                } catch {
+                    remotePanel.error = RemoteOperationError(message: "Cannot view \(item.name): \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -376,7 +441,8 @@ struct CommanderView: View {
                     localURL: item.localURL,
                     remotePath: item.remotePath,
                     isDirectory: item.isDirectory,
-                    moveSource: plan.move
+                    moveSource: plan.move,
+                    compress: transferSettings.compressFolderTransfers
                 ) {
                     Task { await remotePanel.reload() }
                     if plan.move { localPanel.reload() }
@@ -388,7 +454,8 @@ struct CommanderView: View {
                     localURL: item.localURL,
                     remoteSize: item.remoteSize,
                     isDirectory: item.isDirectory,
-                    moveSource: plan.move
+                    moveSource: plan.move,
+                    compress: transferSettings.compressFolderTransfers
                 ) {
                     localPanel.reload()
                     if plan.move { Task { await remotePanel.reload() } }

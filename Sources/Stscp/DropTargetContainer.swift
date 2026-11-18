@@ -7,8 +7,8 @@ import AppKit
 /// SwiftUI's `.dropDestination`'s `action` closure never fires on this macOS build even though
 /// `isTargeted`/the drag ghost work fine — a platform regression, not an app bug. This wraps SwiftUI
 /// content in a real `NSView` that implements `NSDraggingDestination` directly, bypassing SwiftUI's
-/// Transferable bridge entirely for the drop side. (The drag *source* side, `.draggable`, is unaffected
-/// and stays as-is.)
+/// Transferable bridge entirely for the drop side. (The drag *source* side uses `.onDrag` with `InternalDrag`,
+/// whose providers hand the data over synchronously.)
 struct DropTargetContainer<Content: View>: NSViewRepresentable {
     let acceptedTypes: [NSPasteboard.PasteboardType]
     let onEntered: () -> Void
